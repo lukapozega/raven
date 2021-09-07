@@ -897,12 +897,18 @@ void Graph::Assemble() {
   if (stage_ == -3) {  // remove transitive edges
     timer.Start();
 
+    PrintCsv("graph_1.csv");
+    PrintGfa("graph_1.gfa");
+
     RemoveTransitiveEdges();
 
     std::cerr << "[raven::Graph::Assemble] removed transitive edges "
               << std::fixed << timer.Stop() << "s"
               << std::endl;
   }
+
+  PrintCsv("graph_2.csv");
+  PrintGfa("graph_2.gfa");
 
   if (stage_ == -3) {  // checkpoint
     ++stage_;
@@ -931,6 +937,9 @@ void Graph::Assemble() {
               << std::endl;
   }
 
+  PrintCsv("graph_3.csv");
+  PrintGfa("graph_3.gfa");
+
   if (stage_ == -2) {  // checkpoint
     ++stage_;
     if (checkpoints_) {
@@ -945,8 +954,18 @@ void Graph::Assemble() {
   if (stage_ == -1) {  // remove long edges
     timer.Start();
 
+    PrintCsv("graph_4.csv");
+    PrintGfa("graph_4.gfa");
+
     CreateUnitigs(42);  // speed up force directed layout
+
+    PrintCsv("graph_5.csv");
+    PrintGfa("graph_5.gfa");
+
     RemoveLongEdges(16);
+
+    PrintCsv("graph_6.csv");
+    PrintGfa("graph_6.gfa");
 
     std::cerr << "[raven::Graph::Assemble] removed long edges "
               << std::fixed << timer.Stop() << "s"
@@ -963,6 +982,9 @@ void Graph::Assemble() {
     }
 
     SalvagePlasmids();
+
+    PrintCsv("graph_7.csv");
+    PrintGfa("graph_7.gfa");
 
     timer.Stop();
   }
@@ -2081,6 +2103,14 @@ void Graph::PrintCsv(const std::string& path) const {
     if (it == nullptr) {
       continue;
     }
+    std::string lhs{it->tail->sequence.InflateData(it->length)};
+    std::string rhs{it->head->sequence.InflateData(0, lhs.size())};
+    EdlibAlignResult result = edlibAlign(
+        lhs.c_str(), lhs.size(),
+	rhs.c_str(), rhs.size(),
+	edlibDefaultAlignConfig());
+    double score = 1 - result.editDistance / static_cast<double>(lhs.size());
+
     os << it->tail->id << " [" << it->tail->id / 2 << "]"
        << " LN:i:" << it->tail->sequence.inflated_len
        << " RC:i:" << it->tail->count
@@ -2089,7 +2119,7 @@ void Graph::PrintCsv(const std::string& path) const {
        << " LN:i:" << it->head->sequence.inflated_len
        << " RC:i:" << it->head->count
        << ",1,"
-       << it->id << " " << it->length << " " << it->weight
+       << it->id << " " << it->length << " " << it->weight << " " << score
        << std::endl;
   }
   for (const auto& it : nodes_) {  // circular edges TODO(rvaser): check
