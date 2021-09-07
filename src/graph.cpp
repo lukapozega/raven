@@ -893,6 +893,8 @@ void Graph::Assemble() {
   biosoup::Timer timer{};
 
   PrintCsv("graph_1.csv");
+  PrintCsv("graph_before.csv");
+  PrintGfa("graph_before.gfa");
 
   if (stage_ == -3) {  // remove transitive edges
     timer.Start();
@@ -905,6 +907,8 @@ void Graph::Assemble() {
   }
 
   PrintCsv("graph_2.csv");
+  // PrintCsv("graph_before.csv");
+  // PrintGfa("graph_before.gfa");
 
   if (stage_ == -3) {  // checkpoint
     ++stage_;
@@ -958,8 +962,8 @@ void Graph::Assemble() {
     CreateUnitigs(42);  // speed up force directed layout
 
     PrintCsv("graph_4.csv");
-    PrintCsv("graph_before.csv");
-    PrintGfa("graph_before.gfa");
+    // PrintCsv("graph_before.csv");
+    // PrintGfa("graph_before.gfa");
 
     RemoveLongEdges(16);
 
