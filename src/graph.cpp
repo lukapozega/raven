@@ -300,7 +300,7 @@ void Graph::Construct(
           sequences.begin() + j,
           sequences.begin() + i + 1,
           true);
-      minimizer_engine.Filter(0.001);
+      minimizer_engine.Filter(0);  // LV: set filter from 0.001 to 0
 
       std::cerr << "[raven::Graph::Construct] minimized "
                 << j << " - " << i + 1 << " / " << sequences.size() << " "
@@ -624,7 +624,7 @@ void Graph::Construct(
       timer.Start();
 
       std::vector<std::future<std::vector<biosoup::Overlap>>> thread_futures;
-      minimizer_engine.Filter(0.001);
+      minimizer_engine.Filter(0);  // LV: set filter to 0
       for (std::uint32_t k = 0; k < i + 1; ++k) {
         thread_futures.emplace_back(thread_pool_->Submit(
             [&] (std::uint32_t i) -> std::vector<biosoup::Overlap> {
@@ -635,6 +635,23 @@ void Graph::Construct(
                   true,  // avoid symmetric
                   false,  // minhash
                   &filtered);
+
+              // if (sequences[i]->id == 4206) {
+              //   std::cerr << "Num filtered = " << filtered.size() << '\n';
+	      //   for (const auto& it : filtered) {
+	      //     std::cerr << it << " ";
+	      //   } std::cerr << '\n';
+	      //   std::cerr << "Overlaps:\n";
+	      //   for (const auto& it : dst) {
+	      //     std::cerr << "it.rhs_id: " << it.rhs_id << std::endl;
+	      //     if (it.rhs_id == 4207) {
+	      //       std::cerr << it.lhs_begin << " " << it.lhs_end << " "
+	      //                 << it.rhs_begin << " " << it.rhs_end << " "
+	      //                 << it.strand << " " << it.score << std::endl;
+	      //     }
+	      //   }
+	      // }
+
               piles_[sequences[i]->id]->AddKmers(filtered, kmer_len, sequences[i]); // NOLINT
 
               std::uint32_t k = 0;
@@ -668,6 +685,13 @@ void Graph::Construct(
                     0.;
 
                 edlibFreeAlignResult(result);
+
+		// if (jt.lhs_id == 4206 && jt.rhs_id == 4207) {
+		//   std::cerr << score << std::endl;
+		//   if (score < identity) {
+		//     std::cerr << "dieded\n";
+		//   }
+		// }
 
                 if (score < identity) {
                   continue;
@@ -745,7 +769,7 @@ void Graph::Construct(
         });
   }
 
-  if (stage_ == -4) {  // resolve repeat induced overlaps
+  if (stage_ == -4 && false) {  // resolve repeat induced overlaps  // LV: added && false to not enter the if block
     timer.Start();
 
     while (true) {
@@ -785,6 +809,9 @@ void Graph::Construct(
         const auto& it = overlaps.back()[i];
         if (piles_[it.lhs_id]->CheckRepetitiveRegions(it) ||
             piles_[it.rhs_id]->CheckRepetitiveRegions(it)) {
+	  // if (it.lhs_id == 4206 && it.rhs_id == 4207) {
+	  //   std::cerr << it.lhs_begin << " " << it.lhs_end << " " << it.rhs_begin << " " << it.rhs_end << " " << it.strand << " " << it.score << " is filtered\n";
+	  // }
           is_changed = true;
         } else {
           overlaps.back()[j++] = it;
@@ -823,7 +850,7 @@ void Graph::Construct(
       auto sequence = biosoup::NucleicAcid{
           sequences[it->id()]->name,
           sequences[it->id()]->InflateData(it->begin(), it->end() - it->begin())};  // NOLINT
-
+      sequence.id = it->id();
       sequence_to_node[it->id()] = Node::num_objects;
 
       auto node = std::make_shared<Node>(sequence);
@@ -907,8 +934,9 @@ void Graph::Assemble() {
               << std::endl;
   }
 
-  PrintCsv("graph_2.csv");
-  PrintGfa("graph_2.gfa");
+  // PrintCsv("graph_2.csv");
+  // PrintGfa("graph_2.gfa");
+  // exit(1);
 
   if (stage_ == -3) {  // checkpoint
     ++stage_;
@@ -937,8 +965,8 @@ void Graph::Assemble() {
               << std::endl;
   }
 
-  PrintCsv("graph_3.csv");
-  PrintGfa("graph_3.gfa");
+  // PrintCsv("graph_3.csv");
+  // PrintGfa("graph_3.gfa");
 
   if (stage_ == -2) {  // checkpoint
     ++stage_;
@@ -954,18 +982,18 @@ void Graph::Assemble() {
   if (stage_ == -1) {  // remove long edges
     timer.Start();
 
-    PrintCsv("graph_4.csv");
-    PrintGfa("graph_4.gfa");
+    // PrintCsv("graph_4.csv");
+    // PrintGfa("graph_4.gfa");
 
     CreateUnitigs(42);  // speed up force directed layout
 
-    PrintCsv("graph_5.csv");
-    PrintGfa("graph_5.gfa");
+    // PrintCsv("graph_5.csv");
+    // PrintGfa("graph_5.gfa");
 
     RemoveLongEdges(16);
 
-    PrintCsv("graph_6.csv");
-    PrintGfa("graph_6.gfa");
+    // PrintCsv("graph_6.csv");
+    // PrintGfa("graph_6.gfa");
 
     std::cerr << "[raven::Graph::Assemble] removed long edges "
               << std::fixed << timer.Stop() << "s"
@@ -983,8 +1011,8 @@ void Graph::Assemble() {
 
     SalvagePlasmids();
 
-    PrintCsv("graph_7.csv");
-    PrintGfa("graph_7.gfa");
+    // PrintCsv("graph_7.csv");
+    // PrintGfa("graph_7.gfa");
 
     timer.Stop();
   }
@@ -2096,8 +2124,14 @@ void Graph::PrintCsv(const std::string& path) const {
        << it->pair->id << " [" << it->pair->id / 2 << "]"
        << " LN:i:" << it->pair->sequence.inflated_len
        << " RC:i:" << it->pair->count
-       << ",0,-"
-       << std::endl;
+       << ",0,";
+    if (it->sequence.id < piles_.size()) {
+       os << piles_[it->sequence.id]->begin() << " " << piles_[it->sequence.id]->end()
+          << std::endl;
+    } else {
+       os << "-"
+	  << std::endl;
+    }
   }
   for (const auto& it : edges_) {
     if (it == nullptr) {
