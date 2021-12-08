@@ -303,7 +303,7 @@ void Pile::FindRepetitiveRegions(std::uint16_t median) {
 
   repetitive_regions_ = MergeRegions(repetitive_regions_);
   for (auto& it : repetitive_regions_) {
-    it.first = std::max(begin_, it.first) << 1;
+    it.first = std::max(begin_, it.first) << 2;
     it.second = std::min(end_, it.second);
   }
 }
@@ -319,14 +319,14 @@ void Pile::UpdateRepetitiveRegions(const biosoup::Overlap& o) {
   std::uint32_t offset = 0.1 * (end_ - begin_);
 
   for (auto& it : repetitive_regions_) {
-    if (begin < it.second && (it.first >> 1) < end) {
-      if ((it.first >> 1) < begin_ + offset && begin - begin_ < end_ - end) {
+    if (begin < it.second && (it.first >> 2) < end) {
+      if ((it.first >> 2) < begin_ + offset && begin - begin_ < end_ - end) {
         if (end >= it.second + fuzz) {
           it.first |= 1;
         }
       } else if (it.second > end_ - offset && begin - begin_ > end_ - end) {
-        if (begin + fuzz <= (it.first >> 1)) {
-          it.first |= 1;
+        if (begin + fuzz <= (it.first >> 2)) {
+          it.first |= 2;
         }
       }
     }
@@ -344,13 +344,13 @@ bool Pile::CheckRepetitiveRegions(const biosoup::Overlap& o) {
   std::uint32_t offset = 0.1 * (end_ - begin_);
 
   for (const auto& it : repetitive_regions_) {
-    if (begin < it.second && (it.first >> 1) < end) {
-      if ((it.first >> 1) < begin_ + offset) {
+    if (begin < it.second && (it.first >> 2) < end) {
+      if ((it.first >> 2) < begin_ + offset) {
         if (end < it.second + fuzz && (it.first & 1)) {
           return true;
         }
       } else if (it.second > end_ - offset) {
-        if (begin + fuzz > (it.first >> 1) && (it.first & 1)) {
+        if (begin + fuzz > (it.first >> 2) && (it.first & 2)) {
           return true;
         }
       }

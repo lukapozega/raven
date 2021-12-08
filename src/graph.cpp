@@ -300,7 +300,7 @@ void Graph::Construct(
           sequences.begin() + j,
           sequences.begin() + i + 1,
           true);
-      minimizer_engine.Filter(0);  // LV: set filter from 0.001 to 0
+      minimizer_engine.Filter(0.001);  // LV: set filter from 0.001 to 0
 
       std::cerr << "[raven::Graph::Construct] minimized "
                 << j << " - " << i + 1 << " / " << sequences.size() << " "
@@ -352,9 +352,9 @@ void Graph::Construct(
 
                 num_overlaps[i] = std::min(
                     overlaps[i].size(),
-                    static_cast<std::size_t>(16));
+                    static_cast<std::size_t>(64));  // LV: 16 -> 32
 
-                if (overlaps[i].size() < 16) {
+                if (overlaps[i].size() < 64) {  // LV: 16 -> 32
                   return;
                 }
 
@@ -365,7 +365,7 @@ void Graph::Construct(
                     });
 
                 std::vector<biosoup::Overlap> tmp;
-                tmp.insert(tmp.end(), overlaps[i].begin(), overlaps[i].begin() + 16);  // NOLINT
+                tmp.insert(tmp.end(), overlaps[i].begin(), overlaps[i].begin() + 64);  // NOLINT // LV: 16 -> 32
                 tmp.swap(overlaps[i]);
               },
               it->id()));
@@ -513,7 +513,8 @@ void Graph::Construct(
             medians.begin(),
             medians.begin() + medians.size() / 2,
             medians.end());
-        std::uint16_t median = medians[medians.size() / 2];
+        // std::uint16_t median = medians[medians.size() / 2];  // LV: change to fixed 40 below
+        std::uint16_t median = 40;
 
         std::vector<std::future<void>> thread_futures;
         for (const auto& jt : it) {
@@ -624,7 +625,7 @@ void Graph::Construct(
       timer.Start();
 
       std::vector<std::future<std::vector<biosoup::Overlap>>> thread_futures;
-      minimizer_engine.Filter(0);  // LV: set filter to 0
+      minimizer_engine.Filter(0.001);  // LV: set filter to 0 from 0.001
       for (std::uint32_t k = 0; k < i + 1; ++k) {
         thread_futures.emplace_back(thread_pool_->Submit(
             [&] (std::uint32_t i) -> std::vector<biosoup::Overlap> {
@@ -769,7 +770,7 @@ void Graph::Construct(
         });
   }
 
-  if (stage_ == -4 && false) {  // resolve repeat induced overlaps  // LV: added && false to not enter the if block
+  if (stage_ == -4) {  // resolve repeat induced overlaps  // LV: added && false to not enter the if block
     timer.Start();
 
     while (true) {
@@ -926,6 +927,8 @@ void Graph::Assemble() {
 
     PrintCsv("graph_1.csv");
     PrintGfa("graph_1.gfa");
+
+    // exit(1);
 
     RemoveTransitiveEdges();
 
