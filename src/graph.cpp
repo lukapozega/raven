@@ -14,6 +14,7 @@
 #include "biosoup/timer.hpp"
 #include "cereal/archives/binary.hpp"
 #include "cereal/archives/json.hpp"
+#include "edlib.h"  // NOLINT
 #include "racon/polisher.hpp"
 
 #include "edlib.h"
@@ -22,8 +23,9 @@ namespace raven {
 
 Graph::Node::Node(const biosoup::NucleicAcid& sequence)
     : id(num_objects++),
-      sequence(new biosoup::NucleicAcid(sequence)),
+      sequence(sequence),
       count(1),
+      is_unitig(),
       is_circular(),
       is_polished(),
       transitive(),
@@ -35,6 +37,7 @@ Graph::Node::Node(Node* begin, Node* end)
     : id(num_objects++),
       sequence(),
       count(),
+      is_unitig(),
       is_circular(begin == end),
       is_polished(),
       transitive(),
@@ -52,13 +55,15 @@ Graph::Node::Node(Node* begin, Node* end)
     }
   }
   if (begin != end) {
-    data += end->sequence->InflateData();
+    data += end->sequence.InflateData();
     count += end->count;
   }
 
-  sequence = std::unique_ptr<biosoup::NucleicAcid>(
-      new biosoup::NucleicAcid("", data));
-  sequence->name = (is_unitig() ? "Utg" : "Ctg") + std::to_string(id & (~1UL));
+  is_unitig = count > 5 && data.size() > 9999;
+
+  sequence = biosoup::NucleicAcid(
+    (is_unitig ? "Utg" : "Ctg") + std::to_string(id & (~1UL)),
+    data);
 }
 
 Graph::Edge::Edge(Node* tail, Node* head, std::uint32_t length)
@@ -89,7 +94,9 @@ Graph::Graph(
       nodes_(),
       edges_() {}
 
-void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences) {  // NOLINT
+void Graph::Construct(
+    std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,  // NOLINT
+    double identity) {
   if (sequences.empty() || stage_ > -4) {
     return;
   }
@@ -270,9 +277,10 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
 
   biosoup::Timer timer{};
 
+  std::uint32_t kmer_len = accurate_ ? 29 : 15;
   ram::MinimizerEngine minimizer_engine{
       thread_pool_,
-      accurate_ ? 29U : 15U,
+      kmer_len,
       accurate_ ? 9U : 5U
   };
 
@@ -294,7 +302,7 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
           sequences.begin() + j,
           sequences.begin() + i + 1,
           true);
-      minimizer_engine.Filter(0.001);
+      minimizer_engine.Filter(0.001);  // LV: set filter from 0.001 to 0
 
       std::cerr << "[raven::Graph::Construct] minimized "
                 << j << " - " << i + 1 << " / " << sequences.size() << " "
@@ -346,9 +354,9 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
 
                 num_overlaps[i] = std::min(
                     overlaps[i].size(),
-                    static_cast<std::size_t>(16));
+                    static_cast<std::size_t>(64));  // LV: 16 -> 32
 
-                if (overlaps[i].size() < 16) {
+                if (overlaps[i].size() < 64) {  // LV: 16 -> 32
                   return;
                 }
 
@@ -359,7 +367,7 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
                     });
 
                 std::vector<biosoup::Overlap> tmp;
-                tmp.insert(tmp.end(), overlaps[i].begin(), overlaps[i].begin() + 16);  // NOLINT
+                tmp.insert(tmp.end(), overlaps[i].begin(), overlaps[i].begin() + 64);  // NOLINT // LV: 16 -> 32
                 tmp.swap(overlaps[i]);
               },
               it->id()));
@@ -407,6 +415,61 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
   if (stage_ == -5) {  // resolve contained reads
     timer.Start();
 
+    std::vector<std::future<void>> futures;
+    for (std::uint32_t i = 0; i < overlaps.size(); ++i) {
+      futures.emplace_back(thread_pool_->Submit(
+          [&] (std::uint32_t i) -> void {
+            std::uint32_t k = 0;
+            for (std::uint32_t j = 0; j < overlaps[i].size(); ++j) {
+              if (!overlap_update(overlaps[i][j])) {
+                continue;
+              }
+
+              const auto& it = overlaps[i][j];
+
+              auto lhs = sequences[it.lhs_id]->InflateData(
+                  it.lhs_begin,
+                  it.lhs_end - it.lhs_begin);
+
+              auto rhs = sequences[it.rhs_id]->InflateData(
+                  it.rhs_begin,
+                  it.rhs_end - it.rhs_begin);
+              if (!it.strand) {
+                biosoup::NucleicAcid rhs_{"", rhs};
+                rhs_.ReverseAndComplement();
+                rhs = rhs_.InflateData();
+              }
+
+              auto result = edlibAlign(
+                  lhs.c_str(), lhs.size(),
+                  rhs.c_str(), rhs.size(),
+                  edlibDefaultAlignConfig());
+
+              auto score = result.status == EDLIB_STATUS_OK ?
+                  1. - static_cast<double>(result.editDistance) / std::max(lhs.size(), rhs.size()) :  // NOLINT
+                  0.;
+
+              edlibFreeAlignResult(result);
+
+              if (score < identity) {
+                continue;
+              }
+              overlaps[i][k++] = overlaps[i][j];
+            }
+            overlaps[i].resize(k);
+          },
+          i));
+    }
+    for (const auto& it : futures) {
+      it.wait();
+    }
+
+    std::cerr << "[raven::Graph::Construct] filtered overlaps "
+              << std::fixed << timer.Stop() << "s"
+              << std::endl;
+
+    timer.Start();
+
     for (std::uint32_t i = 0; i < overlaps.size(); ++i) {
       std::uint32_t k = 0;
       for (std::uint32_t j = 0; j < overlaps[i].size(); ++j) {
@@ -452,7 +515,8 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
             medians.begin(),
             medians.begin() + medians.size() / 2,
             medians.end());
-        std::uint16_t median = medians[medians.size() / 2];
+        // std::uint16_t median = medians[medians.size() / 2];  // LV: change to fixed 40 below
+        std::uint16_t median = 40;
 
         std::vector<std::future<void>> thread_futures;
         for (const auto& jt : it) {
@@ -518,37 +582,18 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
     }
   }
 
-  if (stage_ == -4) {  // clear piles for sensitive overlaps
-    timer.Start();
-
-    std::vector<std::future<void>> thread_futures;
-    for (std::uint32_t i = 0; i < piles_.size(); ++i) {
-      if (piles_[i]->is_invalid()) {
-        continue;
-      }
-      thread_futures.emplace_back(thread_pool_->Submit(
-          [&] (std::uint32_t i) -> void {
-            piles_[i]->ClearValidRegion();
-          },
-          i));
-    }
-    for (const auto& it : thread_futures) {
-      it.wait();
-    }
-    thread_futures.clear();
-
-    std::cerr << "[raven::Graph::Construct] cleared piles "
-              << std::fixed << timer.Stop() << "s"
-              << std::endl;
-  }
-
-  if (stage_ == -4) {  // find overlaps and update piles with repetitive regions
+  if (stage_ == -4) {  // find overlaps and repetitive regions
     std::sort(sequences.begin(), sequences.end(),
         [&] (const std::unique_ptr<biosoup::NucleicAcid>& lhs,
              const std::unique_ptr<biosoup::NucleicAcid>& rhs) -> bool {
           return piles_[lhs->id]->is_invalid() <  piles_[rhs->id]->is_invalid() ||  // NOLINT
                 (piles_[lhs->id]->is_invalid() == piles_[rhs->id]->is_invalid() && lhs->id < rhs->id);  // NOLINT
         });
+
+    std::vector<std::uint32_t> sequences_map(sequences.size());
+    for (std::uint32_t i = 0; i < sequences.size(); ++i) {
+      sequences_map[sequences[i]->id] = i;
+    }
 
     std::uint32_t s = 0;
     for (std::uint32_t i = 0; i < sequences.size(); ++i) {
@@ -558,78 +603,9 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
       }
     }
 
-    // map invalid reads to valid reads
+    // map valid reads to each other
     overlaps.resize(sequences.size() + 1);
     std::size_t bytes = 0;
-    for (std::uint32_t i = 0, j = 0; i < s; ++i) {
-      bytes += sequences[i]->inflated_len;
-      if (i != s - 1 && bytes < (1ULL << 32)) {
-        continue;
-      }
-      bytes = 0;
-
-      timer.Start();
-
-      minimizer_engine.Minimize(
-          sequences.begin() + j,
-          sequences.begin() + i + 1,
-          true);
-
-      std::cerr << "[raven::Graph::Construct] minimized "
-                << j << " - " << i + 1 << " / " << s << " "
-                << std::fixed << timer.Stop() << "s"
-                << std::endl;
-
-      timer.Start();
-
-      minimizer_engine.Filter(0.00001);
-      std::vector<std::future<std::vector<biosoup::Overlap>>> thread_futures;
-      for (std::uint32_t k = s; k < sequences.size(); ++k) {
-        thread_futures.emplace_back(thread_pool_->Submit(
-            [&] (std::uint32_t i) -> std::vector<biosoup::Overlap> {
-              return minimizer_engine.Map(sequences[i], true, false, true);
-            },
-            k));
-
-        bytes += sequences[k]->inflated_len;
-        if (k != sequences.size() - 1 && bytes < (1U << 30)) {
-          continue;
-        }
-        bytes = 0;
-
-        for (auto& it : thread_futures) {
-          for (const auto& jt : it.get()) {
-            overlaps[jt.rhs_id].emplace_back(jt);
-          }
-        }
-        thread_futures.clear();
-
-        std::vector<std::future<void>> void_futures;
-        for (std::uint32_t k = j; k < i + 1; ++k) {
-          if (overlaps[sequences[k]->id].empty()) {
-            continue;
-          }
-          void_futures.emplace_back(thread_pool_->Submit(
-              [&] (std::uint32_t i) -> void {
-                piles_[i]->AddLayers(overlaps[i].begin(), overlaps[i].end());
-                std::vector<biosoup::Overlap>().swap(overlaps[i]);
-              },
-              sequences[k]->id));
-        }
-        for (const auto& it : void_futures) {
-          it.wait();
-        }
-      }
-
-      std::cerr << "[raven::Graph::Construct] mapped invalid sequences "
-                << std::fixed << timer.Stop() << "s"
-                << std::endl;
-
-      j = i + 1;
-    }
-
-    // map valid reads to each other
-    bytes = 0;
     for (std::uint32_t i = 0, j = 0; i < s; ++i) {
       bytes += sequences[i]->inflated_len;
       if (i != s - 1 && bytes < (1U << 30)) {
@@ -651,11 +627,83 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
       timer.Start();
 
       std::vector<std::future<std::vector<biosoup::Overlap>>> thread_futures;
-      minimizer_engine.Filter(0.001);
+      minimizer_engine.Filter(0.001);  // LV: set filter to 0 from 0.001
       for (std::uint32_t k = 0; k < i + 1; ++k) {
         thread_futures.emplace_back(thread_pool_->Submit(
             [&] (std::uint32_t i) -> std::vector<biosoup::Overlap> {
-              return minimizer_engine.Map(sequences[i], true, true);
+              std::vector<std::uint32_t> filtered;
+              auto dst = minimizer_engine.Map(
+                  sequences[i],
+                  true,  // avoid equal
+                  true,  // avoid symmetric
+                  false,  // minhash
+                  &filtered);
+
+              // if (sequences[i]->id == 4206) {
+              //   std::cerr << "Num filtered = " << filtered.size() << '\n';
+	      //   for (const auto& it : filtered) {
+	      //     std::cerr << it << " ";
+	      //   } std::cerr << '\n';
+	      //   std::cerr << "Overlaps:\n";
+	      //   for (const auto& it : dst) {
+	      //     std::cerr << "it.rhs_id: " << it.rhs_id << std::endl;
+	      //     if (it.rhs_id == 4207) {
+	      //       std::cerr << it.lhs_begin << " " << it.lhs_end << " "
+	      //                 << it.rhs_begin << " " << it.rhs_end << " "
+	      //                 << it.strand << " " << it.score << std::endl;
+	      //     }
+	      //   }
+	      // }
+
+              piles_[sequences[i]->id]->AddKmers(filtered, kmer_len, sequences[i]); // NOLINT
+
+              std::uint32_t k = 0;
+              for (std::uint32_t j = 0; j < dst.size(); ++j) {
+                if (!overlap_update(dst[j])) {
+                  continue;
+                }
+
+                const auto& jt = dst[j];
+
+                auto lhs = sequences[sequences_map[jt.lhs_id]]->InflateData(
+                    jt.lhs_begin,
+                    jt.lhs_end - jt.lhs_begin);
+
+                auto rhs = sequences[sequences_map[jt.rhs_id]]->InflateData(
+                    jt.rhs_begin,
+                    jt.rhs_end - jt.rhs_begin);
+                if (!jt.strand) {
+                  biosoup::NucleicAcid rhs_{"", rhs};
+                  rhs_.ReverseAndComplement();
+                  rhs = rhs_.InflateData();
+                }
+
+                auto result = edlibAlign(
+                    lhs.c_str(), lhs.size(),
+                    rhs.c_str(), rhs.size(),
+                    edlibDefaultAlignConfig());
+
+                auto score = result.status == EDLIB_STATUS_OK ?
+                    1. - static_cast<double>(result.editDistance) / std::max(lhs.size(), rhs.size()) :  // NOLINT
+                    0.;
+
+                edlibFreeAlignResult(result);
+
+		// if (jt.lhs_id == 4206 && jt.rhs_id == 4207) {
+		//   std::cerr << score << std::endl;
+		//   if (score < identity) {
+		//     std::cerr << "dieded\n";
+		//   }
+		// }
+
+                if (score < identity) {
+                  continue;
+                }
+                dst[k++] = dst[j];
+              }
+              dst.resize(k);
+
+              return dst;
             },
             k));
       }
@@ -664,6 +712,7 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
           if (!overlap_update(jt)) {
             continue;
           }
+
           std::uint32_t type = overlap_type(jt);
           if (type == 0) {
             continue;
@@ -699,28 +748,8 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
     for (std::uint32_t i = 0; i < piles_.size(); ++i) {
       if (piles_[i]->is_contained()) {
         piles_[i]->set_is_invalid();
-        continue;
       }
-      if (piles_[i]->is_invalid()) {
-        continue;
-      }
-      thread_futures.emplace_back(thread_pool_->Submit(
-          [&] (std::uint32_t i) -> void {
-            piles_[i]->ClearInvalidRegion();
-            piles_[i]->FindMedian();
-          },
-          i));
     }
-    for (const auto& it : thread_futures) {
-      it.wait();
-    }
-    thread_futures.clear();
-
-    std::cerr << "[raven::Graph::Construct] updated piles "
-              << std::fixed << timer.Stop() << "s"
-              << std::endl;
-
-    timer.Start();
 
     {
       std::uint32_t k = 0;
@@ -743,7 +772,7 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
         });
   }
 
-  if (stage_ == -4) {  // resolve repeat induced overlaps
+  if (stage_ == -4) {  // resolve repeat induced overlaps  // LV: added && false to not enter the if block
     timer.Start();
 
     while (true) {
@@ -783,6 +812,9 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
         const auto& it = overlaps.back()[i];
         if (piles_[it.lhs_id]->CheckRepetitiveRegions(it) ||
             piles_[it.rhs_id]->CheckRepetitiveRegions(it)) {
+	  // if (it.lhs_id == 4206 && it.rhs_id == 4207) {
+	  //   std::cerr << it.lhs_begin << " " << it.lhs_end << " " << it.rhs_begin << " " << it.rhs_end << " " << it.strand << " " << it.score << " is filtered\n";
+	  // }
           is_changed = true;
         } else {
           overlaps.back()[j++] = it;
@@ -821,7 +853,7 @@ void Graph::Construct(std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequen
       auto sequence = biosoup::NucleicAcid{
           sequences[it->id()]->name,
           sequences[it->id()]->InflateData(it->begin(), it->end() - it->begin())};  // NOLINT
-
+      sequence.id = it->id();
       sequence_to_node[it->id()] = Node::num_objects;
 
       auto node = std::make_shared<Node>(sequence);
@@ -899,6 +931,11 @@ void Graph::Assemble() {
   if (stage_ == -3) {  // remove transitive edges
     timer.Start();
 
+    PrintCsv("graph_1.csv");
+    PrintGfa("graph_1.gfa");
+
+    // exit(1);
+
     RemoveTransitiveEdges();
 
     std::cerr << "[raven::Graph::Assemble] removed transitive edges "
@@ -906,9 +943,15 @@ void Graph::Assemble() {
               << std::endl;
   }
 
+<<<<<<< HEAD
   PrintCsv("graph_2.csv");
   // PrintCsv("graph_before.csv");
   // PrintGfa("graph_before.gfa");
+=======
+  // PrintCsv("graph_2.csv");
+  // PrintGfa("graph_2.gfa");
+  // exit(1);
+>>>>>>> filter
 
   if (stage_ == -3) {  // checkpoint
     ++stage_;
@@ -921,18 +964,12 @@ void Graph::Assemble() {
     }
   }
 
-  ram::MinimizerEngine minimizer_engine{
-      thread_pool_,
-      accurate_ ? 29U : 15U,
-      accurate_ ? 9U : 5U
-  };
-
   if (stage_ == -2) {  // remove tips and bubbles
     timer.Start();
 
     while (true) {
       std::uint32_t num_changes = RemoveTips();
-      num_changes += RemoveBubbles(minimizer_engine);
+      num_changes += RemoveBubbles();
       if (num_changes == 0) {
         break;
       }
@@ -943,7 +980,12 @@ void Graph::Assemble() {
               << std::endl;
   }
 
+<<<<<<< HEAD
   PrintCsv("graph_3.csv");
+=======
+  // PrintCsv("graph_3.csv");
+  // PrintGfa("graph_3.gfa");
+>>>>>>> filter
 
   if (stage_ == -2) {  // checkpoint
     ++stage_;
@@ -959,8 +1001,12 @@ void Graph::Assemble() {
   if (stage_ == -1) {  // remove long edges
     timer.Start();
 
+    // PrintCsv("graph_4.csv");
+    // PrintGfa("graph_4.gfa");
+
     CreateUnitigs(42);  // speed up force directed layout
 
+<<<<<<< HEAD
     PrintCsv("graph_4.csv");
     // PrintCsv("graph_before.csv");
     // PrintGfa("graph_before.gfa");
@@ -968,6 +1014,15 @@ void Graph::Assemble() {
     RemoveLongEdges(16);
 
     PrintCsv("graph_5.csv");
+=======
+    // PrintCsv("graph_5.csv");
+    // PrintGfa("graph_5.gfa");
+
+    RemoveLongEdges(16);
+
+    // PrintCsv("graph_6.csv");
+    // PrintGfa("graph_6.gfa");
+>>>>>>> filter
 
     std::cerr << "[raven::Graph::Assemble] removed long edges "
               << std::fixed << timer.Stop() << "s"
@@ -977,11 +1032,16 @@ void Graph::Assemble() {
 
     while (true) {
       std::uint32_t num_changes = RemoveTips();
-      num_changes += RemoveBubbles(minimizer_engine);
+      num_changes += RemoveBubbles();
       if (num_changes == 0) {
         break;
       }
     }
+
+    SalvagePlasmids();
+
+    // PrintCsv("graph_7.csv");
+    // PrintGfa("graph_7.gfa");
 
     timer.Stop();
   }
@@ -1100,7 +1160,7 @@ std::uint32_t Graph::RemoveTips() {
   return num_tips;
 }
 
-std::uint32_t Graph::RemoveBubbles(const ram::MinimizerEngine& minimizer_engine) {  // NOLINT
+std::uint32_t Graph::RemoveBubbles() {
   std::vector<std::uint32_t> distance(nodes_.size(), 0);
   std::vector<Node*> predecessor(nodes_.size(), nullptr);
 
@@ -1126,8 +1186,7 @@ std::uint32_t Graph::RemoveBubbles(const ram::MinimizerEngine& minimizer_engine)
     }
     return true;  // without branches
   };
-  auto path_sequence = [] (const std::vector<Node*>& path) ->
-      std::unique_ptr<biosoup::NucleicAcid> {
+  auto path_sequence = [] (const std::vector<Node*>& path) -> std::string {
     std::string data{};
     for (std::uint32_t i = 0; i < path.size() - 1; ++i) {
       for (auto it : path[i]->outedges) {
@@ -1137,9 +1196,8 @@ std::uint32_t Graph::RemoveBubbles(const ram::MinimizerEngine& minimizer_engine)
         }
       }
     }
-    data += path.back()->sequence->InflateData();
-    return std::unique_ptr<biosoup::NucleicAcid>(
-        new biosoup::NucleicAcid("", data));
+    data += path.back()->sequence.InflateData();
+    return data;
   };
   auto bubble_pop = [&] (
       const std::vector<Node*>& lhs,
@@ -1170,17 +1228,21 @@ std::uint32_t Graph::RemoveBubbles(const ram::MinimizerEngine& minimizer_engine)
       // check similarity
       auto l = path_sequence(lhs);
       auto r = path_sequence(rhs);
-      if (std::min(l->inflated_len, r->inflated_len) <
-          std::max(l->inflated_len, r->inflated_len) * 0.8) {
+      if (std::min(l.size(), r.size()) < std::max(l.size(), r.size()) * 0.8) {
         return std::unordered_set<std::uint32_t>{};
       }
 
-      auto overlaps = minimizer_engine.Map(l, r);
-      std::uint32_t matches = 0;
-      for (const auto& it : overlaps) {
-        matches = std::max(matches, it.score);
+      EdlibAlignResult result = edlibAlign(
+          l.c_str(), l.size(),
+          r.c_str(), r.size(),
+          edlibDefaultAlignConfig());
+      double score = 0;
+      if (result.status == EDLIB_STATUS_OK) {
+        score = 1 - result.editDistance /
+            static_cast<double>(std::max(l.size(), r.size()));
+        edlibFreeAlignResult(result);
       }
-      if (matches <= 0.5 * std::min(l->inflated_len, r->inflated_len)) {
+      if (score < 0.5) {
         return std::unordered_set<std::uint32_t>{};
       }
     }
@@ -1367,7 +1429,7 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
       y /= c;
       return *this;
     }
-    double norm() const {
+    double Norm() const {
       return sqrt(x * x + y * y);
     }
 
@@ -1384,7 +1446,7 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
           subtrees() {
     }
 
-    bool add(const Point& p) {
+    bool Add(const Point& p) {
       if (nucleus.x - width > p.x || p.x > nucleus.x + width ||
           nucleus.y - width > p.y || p.y > nucleus.y + width) {
         return false;
@@ -1402,40 +1464,40 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
         subtrees.emplace_back(Point(nucleus.x - w, nucleus.y - w), w);
         subtrees.emplace_back(Point(nucleus.x + w, nucleus.y - w), w);
         for (auto& it : subtrees) {
-          if (it.add(center)) {
+          if (it.Add(center)) {
             break;
           }
         }
       }
       for (auto& it : subtrees) {
-        if (it.add(p)) {
+        if (it.Add(p)) {
           break;
         }
       }
       return true;
     }
 
-    void centre() {
+    void Centre() {
       if (subtrees.empty()) {
         return;
       }
       center = Point(0, 0);
       for (auto& it : subtrees) {
-        it.centre();
+        it.Centre();
         center += it.center * it.mass;
       }
       center /= mass;
     }
 
-    Point force(const Point& p, double k) const {
+    Point Force(const Point& p, double k) const {
       auto delta = p - center;
-      auto distance = delta.norm();
+      auto distance = delta.Norm();
       if (width * 2 / distance < 1) {
         return delta * (mass * (k * k) / (distance * distance));
       }
       delta = Point(0, 0);
       for (const auto& it : subtrees) {
-        delta += it.force(p, k);
+        delta += it.Force(p, k);
       }
       return delta;
     }
@@ -1498,19 +1560,19 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
 
       Quadtree tree(Point(x.x + w, y.x + h), std::max(w, h) + 0.01);
       for (const auto& n : component) {
-        tree.add(points[n]);
+        tree.Add(points[n]);
       }
-      tree.centre();
+      tree.Centre();
 
       std::vector<std::future<void>> thread_futures;
       std::vector<Point> displacements(nodes_.size(), Point(0, 0));
 
       auto thread_task = [&](std::uint32_t n) -> void {
-        auto displacement = tree.force(points[n], k);
+        auto displacement = tree.Force(points[n], k);
         for (auto e : nodes_[n]->inedges) {
           auto m = (e->tail->id >> 1) << 1;
           auto delta = points[n] - points[m];
-          auto distance = delta.norm();
+          auto distance = delta.Norm();
           if (distance < 0.01) {
             distance = 0.01;
           }
@@ -1519,7 +1581,7 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
         for (auto e : nodes_[n]->outedges) {
           auto m = (e->head->id >> 1) << 1;
           auto delta = points[n] - points[m];
-          auto distance = delta.norm();
+          auto distance = delta.Norm();
           if (distance < 0.01) {
             distance = 0.01;
           }
@@ -1527,13 +1589,13 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
         }
         for (const auto& m : nodes_[n]->transitive) {
           auto delta = points[n] - points[m];
-          auto distance = delta.norm();
+          auto distance = delta.Norm();
           if (distance < 0.01) {
             distance = 0.01;
           }
           displacement += delta * (-1. * distance / k);
         }
-        auto length = displacement.norm();
+        auto length = displacement.Norm();
         if (length < 0.01) {
           length = 0.1;
         }
@@ -1563,7 +1625,7 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
 
       if (component.find(n) != component.end() &&
           component.find(m) != component.end()) {
-        it->weight = (points[n] - points[m]).norm();
+        it->weight = (points[n] - points[m]).Norm();
         it->pair->weight = it->weight;
       }
     }
@@ -1639,6 +1701,75 @@ void Graph::CreateForceDirectedLayout(const std::string& path) {
   }
 }
 
+std::uint32_t Graph::SalvagePlasmids() {
+  CreateUnitigs();
+
+  std::vector<std::unique_ptr<biosoup::NucleicAcid>> plasmids;
+  for (const auto& it : nodes_) {
+    if (!it || it->is_rc() || it->is_unitig || !it->is_circular) {
+      continue;
+    }
+    plasmids.emplace_back(new biosoup::NucleicAcid(it->sequence));
+  }
+  if (plasmids.empty()) {
+    return 0;
+  }
+
+  std::vector<std::unique_ptr<biosoup::NucleicAcid>> unitigs;
+  for (const auto& it : nodes_) {
+    if (!it || it->is_rc() || !it->is_unitig) {
+      continue;
+    }
+    unitigs.emplace_back(new biosoup::NucleicAcid(it->sequence));
+  }
+  if (unitigs.empty()) {
+    return 0;
+  }
+
+  // remove duplicates within plasmids
+  std::sort(plasmids.begin(), plasmids.end(),
+      [] (const std::unique_ptr<biosoup::NucleicAcid>& lhs,
+          const std::unique_ptr<biosoup::NucleicAcid>& rhs) -> bool {
+        return lhs->inflated_len < rhs->inflated_len;
+      });
+  for (std::uint32_t i = 0; i < plasmids.size(); ++i) {
+    plasmids[i]->id = i;
+  }
+
+  ram::MinimizerEngine minimizer_engine{thread_pool_};
+  minimizer_engine.Minimize(plasmids.begin(), plasmids.end());
+  minimizer_engine.Filter(0.001);
+  for (auto& it : plasmids) {
+    if (!minimizer_engine.Map(it, true, true).empty()) {
+      it.reset();
+    }
+  }
+  plasmids.erase(
+      std::remove(plasmids.begin(), plasmids.end(), nullptr),
+      plasmids.end());
+
+  // remove duplicates between plasmids and unitigs
+  minimizer_engine.Minimize(unitigs.begin(), unitigs.end(), true);
+  minimizer_engine.Filter(0.001);
+  for (auto& it : plasmids) {
+    if (!minimizer_engine.Map(it, false, false).empty()) {
+      it.reset();
+    }
+  }
+  plasmids.erase(
+      std::remove(plasmids.begin(), plasmids.end(), nullptr),
+      plasmids.end());
+
+  // update nodes
+  for (const auto& it : plasmids) {
+    const auto& node = nodes_[std::atoi(&it->name[3])];
+    node->is_unitig = node->pair->is_unitig = true;
+    node->sequence.name[0] = node->pair->sequence.name[0] = 'U';
+  }
+
+  return plasmids.size();
+}
+
 void Graph::Polish(
     const std::vector<std::unique_ptr<biosoup::NucleicAcid>>& sequences,
     std::uint8_t match,
@@ -1698,13 +1829,16 @@ void Graph::Polish(
       std::size_t tag;
       if ((tag = it->name.rfind(':')) != std::string::npos) {
         if (std::atof(&it->name[tag + 1]) > 0) {
-          node->is_polished = true;
-          node->sequence = std::unique_ptr<biosoup::NucleicAcid>(
-              new biosoup::NucleicAcid(*(it.get())));
-          it->ReverseAndComplement();
-          node->pair->sequence = std::unique_ptr<biosoup::NucleicAcid>(
-              new biosoup::NucleicAcid(*(it.get())));
-          it->ReverseAndComplement();
+          if (node->is_circular) {  // rotate
+            auto s = it->InflateData();
+            std::size_t b = 0.42 * s.size();
+            s = s.substr(b) + s.substr(0, b);
+            it->deflated_data = biosoup::NucleicAcid{"", s}.deflated_data;
+          }
+
+          node->is_polished = node->pair->is_polished = true;
+          node->sequence.deflated_data = node->pair->sequence.deflated_data = it->deflated_data;  // NOLINT
+          node->sequence.inflated_len = node->pair->sequence.inflated_len = it->inflated_len;  // NOLINT
         }
       }
     }
@@ -1803,7 +1937,7 @@ std::uint32_t Graph::CreateUnitigs(std::uint32_t epsilon) {
         unitig_edges.emplace_back(std::make_shared<Edge>(
             unitig->pair,
             begin->inedges.front()->pair->head,
-            begin->inedges.front()->pair->length + unitig->pair->sequence->inflated_len - begin->pair->sequence->inflated_len));  // NOLINT
+            begin->inedges.front()->pair->length + unitig->pair->sequence.inflated_len - begin->pair->sequence.inflated_len));  // NOLINT
         edge->pair = unitig_edges.back().get();
         edge->pair->pair = edge.get();
       }
@@ -1814,7 +1948,7 @@ std::uint32_t Graph::CreateUnitigs(std::uint32_t epsilon) {
         auto edge = std::make_shared<Edge>(
             unitig.get(),
             end->outedges.front()->head,
-            end->outedges.front()->length + unitig->sequence->inflated_len - end->sequence->inflated_len);  // NOLINT
+            end->outedges.front()->length + unitig->sequence.inflated_len - end->sequence.inflated_len);  // NOLINT
         unitig_edges.emplace_back(edge);
         unitig_edges.emplace_back(std::make_shared<Edge>(
             end->outedges.front()->pair->tail,
@@ -1868,21 +2002,21 @@ std::vector<std::unique_ptr<biosoup::NucleicAcid>> Graph::GetUnitigs(
 
   std::vector<std::unique_ptr<biosoup::NucleicAcid>> dst;
   for (const auto& it : nodes_) {
-    if (it == nullptr || it->is_rc() || !it->is_unitig()) {
+    if (it == nullptr || it->is_rc() || !it->is_unitig) {
       continue;
     }
     if (drop_unpolished && !it->is_polished) {
       continue;
     }
 
-    std::string name = it->sequence->name +
-        " LN:i:" + std::to_string(it->sequence->inflated_len) +
+    std::string name = it->sequence.name +
+        " LN:i:" + std::to_string(it->sequence.inflated_len) +
         " RC:i:" + std::to_string(it->count) +
         " XO:i:" + std::to_string(it->is_circular);
 
     dst.emplace_back(new biosoup::NucleicAcid(
         name,
-        it->sequence->InflateData()));
+        it->sequence.InflateData()));
   }
 
   return dst;
@@ -2015,21 +2149,32 @@ void Graph::PrintCsv(const std::string& path) const {
       continue;
     }
     os << it->id << " [" << it->id / 2 << "]"
-       << " LN:i:" << it->sequence->inflated_len
+       << " LN:i:" << it->sequence.inflated_len
        << " RC:i:" << it->count
        << ","
        << it->pair->id << " [" << it->pair->id / 2 << "]"
-       << " LN:i:" << it->pair->sequence->inflated_len
+       << " LN:i:" << it->pair->sequence.inflated_len
        << " RC:i:" << it->pair->count
-       << ",0,-"
-       << std::endl;
+       << ",0,";
+    if (it->sequence.id < piles_.size()) {
+       os << piles_[it->sequence.id]->begin() << " " << piles_[it->sequence.id]->end()
+          << std::endl;
+    } else {
+       os << "-"
+	  << std::endl;
+    }
   }
   for (const auto& it : edges_) {
     if (it == nullptr) {
       continue;
     }
+<<<<<<< HEAD
     std::string lhs{it->tail->sequence->InflateData(it->length)};
     std::string rhs{it->head->sequence->InflateData(0, lhs.size())};
+=======
+    std::string lhs{it->tail->sequence.InflateData(it->length)};
+    std::string rhs{it->head->sequence.InflateData(0, lhs.size())};
+>>>>>>> filter
     EdlibAlignResult result = edlibAlign(
         lhs.c_str(), lhs.size(),
 	rhs.c_str(), rhs.size(),
@@ -2037,11 +2182,11 @@ void Graph::PrintCsv(const std::string& path) const {
     double score = 1 - result.editDistance / static_cast<double>(lhs.size());
 
     os << it->tail->id << " [" << it->tail->id / 2 << "]"
-       << " LN:i:" << it->tail->sequence->inflated_len
+       << " LN:i:" << it->tail->sequence.inflated_len
        << " RC:i:" << it->tail->count
        << ","
        << it->head->id << " [" << it->head->id / 2 << "]"
-       << " LN:i:" << it->head->sequence->inflated_len
+       << " LN:i:" << it->head->sequence.inflated_len
        << " RC:i:" << it->head->count
        << ",1,"
        << it->id << " " << it->length << " " << it->weight << " " << score
@@ -2052,11 +2197,11 @@ void Graph::PrintCsv(const std::string& path) const {
       continue;
     }
     os << it->id << " [" << it->id / 2 << "]"
-       << " LN:i:" << it->sequence->inflated_len
+       << " LN:i:" << it->sequence.inflated_len
        << " RC:i:" << it->count
        << ","
        << it->id << " [" << it->id / 2 << "]"
-       << " LN:i:" << it->sequence->inflated_len
+       << " LN:i:" << it->sequence.inflated_len
        << " RC:i:" << it->count
        << ",1,-"
        << std::endl;
@@ -2075,14 +2220,14 @@ void Graph::PrintGfa(const std::string& path) const {
         (it->count == 1 && it->outdegree() == 0 && it->indegree() == 0)) {
       continue;
     }
-    os << "S\t" << it->sequence->name
-       << "\t"  << it->sequence->InflateData()
-       << "\tLN:i:" << it->sequence->inflated_len
+    os << "S\t" << it->sequence.name
+       << "\t"  << it->sequence.InflateData()
+       << "\tLN:i:" << it->sequence.inflated_len
        << "\tRC:i:" << it->count
        << std::endl;
     if (it->is_circular) {
-      os << "L\t" << it->sequence->name << "\t" << '+'
-         << "\t"  << it->sequence->name << "\t" << '+'
+      os << "L\t" << it->sequence.name << "\t" << '+'
+         << "\t"  << it->sequence.name << "\t" << '+'
          << "\t0M"
          << std::endl;
     }
@@ -2091,9 +2236,9 @@ void Graph::PrintGfa(const std::string& path) const {
     if (it == nullptr || it->is_rc()) {
       continue;
     }
-    os << "L\t" << it->tail->sequence->name << "\t" << (it->tail->is_rc() ? '-' : '+')  // NOLINT
-       << "\t"  << it->head->sequence->name << "\t" << (it->head->is_rc() ? '-' : '+')  // NOLINT
-       << "\t"  << it->tail->sequence->inflated_len - it->length << 'M'
+    os << "L\t" << it->tail->sequence.name << "\t" << (it->tail->is_rc() ? '-' : '+')  // NOLINT
+       << "\t"  << it->head->sequence.name << "\t" << (it->head->is_rc() ? '-' : '+')  // NOLINT
+       << "\t"  << it->tail->sequence.inflated_len - it->length << 'M'
        << std::endl;
   }
   os.close();

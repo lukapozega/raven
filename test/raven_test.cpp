@@ -1,11 +1,11 @@
 // Copyright (c) 2020 Robert Vaser
 
+#include "graph.hpp"
+
 #include "bioparser/fasta_parser.hpp"
 #include "bioparser/fastq_parser.hpp"
 #include "edlib.h"  // NOLINT
 #include "gtest/gtest.h"
-
-#include "graph.hpp"
 
 std::atomic<std::uint32_t> biosoup::NucleicAcid::num_objects{0};
 
@@ -17,12 +17,12 @@ class RavenTest: public ::testing::Test {
   void SetUp() {
     biosoup::NucleicAcid::num_objects = 0;
     auto p = bioparser::Parser<biosoup::NucleicAcid>::Create<bioparser::FastqParser>(  // NOLINT
-        RAVEN_DATA_PATH + std::string("ERA476754.fastq.gz"));
+        TEST_DATA + std::string("ERA476754.fastq.gz"));
     s = p->Parse(-1);
 
     biosoup::NucleicAcid::num_objects = 0;
     p = bioparser::Parser<biosoup::NucleicAcid>::Create<bioparser::FastaParser>(  // NOLINT
-        RAVEN_DATA_PATH + std::string("NC_001416.fasta.gz"));
+        TEST_DATA + std::string("NC_001416.fasta.gz"));
     r = std::move(p->Parse(-1).front());
   }
 

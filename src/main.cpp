@@ -14,10 +14,9 @@ std::atomic<std::uint32_t> biosoup::NucleicAcid::num_objects{0};
 
 namespace {
 
-const char* raven_version = RAVEN_VERSION;
-
 static struct option options[] = {
   {"weaken", no_argument, nullptr, 'w'},
+  {"filter", required_argument, nullptr, 'f'},
   {"polishing-rounds", required_argument, nullptr, 'p'},
   {"match", required_argument, nullptr, 'm'},
   {"mismatch", required_argument, nullptr, 'n'},
@@ -27,7 +26,7 @@ static struct option options[] = {
   {"cuda-banded-alignment", no_argument, nullptr, 'b'},
   {"cuda-alignment-batches", required_argument, nullptr, 'a'},
 #endif
-  {"graphical-fragment-assembly", required_argument, nullptr, 'f'},
+  {"graphical-fragment-assembly", required_argument, nullptr, 'F'},
   {"resume", no_argument, nullptr, 'r'},
   {"disable-checkpoints", no_argument, nullptr, 'd'},
   {"threads", required_argument, nullptr, 't'},
@@ -71,7 +70,7 @@ std::unique_ptr<bioparser::Parser<biosoup::NucleicAcid>> CreateParser(
 
 void Help() {
   std::cout <<
-      "usage: raven [options ...] <sequences>\n"
+      "usage: raven [options ...] <sequences> [<sequences> ...]\n"
       "\n"
       "  # default output is to stdout in FASTA format\n"
       "  <sequences>\n"
@@ -80,6 +79,9 @@ void Help() {
       "  options:\n"
       "    --weaken\n"
       "      use larger (k, w) when assembling highly accurate sequences\n"
+      "    -f, --filter <double>\n"
+      "      default: 0.999\n"
+      "      overlap identity threshold\n"
       "    -p, --polishing-rounds <int>\n"
       "      default: 2\n"
       "      number of times racon is invoked\n"
@@ -122,6 +124,7 @@ void Help() {
 
 int main(int argc, char** argv) {
   bool weaken = false;
+  double identity = 0.999;
 
   std::int32_t num_polishing_rounds = 2;
   std::int8_t m = 3;
@@ -138,7 +141,7 @@ int main(int argc, char** argv) {
   std::uint32_t cuda_alignment_batches = 0;
   bool cuda_banded_alignment = false;
 
-  std::string optstr = "p:m:n:g:t:h";
+  std::string optstr = "f:p:m:n:g:t:h";
 #ifdef CUDA_ENABLED
   optstr += "c:ba:";
 #endif
@@ -146,6 +149,7 @@ int main(int argc, char** argv) {
   while ((arg = getopt_long(argc, argv, optstr.c_str(), options, nullptr)) != -1) {  // NOLINT
     switch (arg) {
       case 'w': weaken = true; break;
+      case 'f': identity = atof(optarg); break;
       case 'p': num_polishing_rounds = atoi(optarg); break;
       case 'm': m = atoi(optarg); break;
       case 'n': n = atoi(optarg); break;
@@ -169,11 +173,11 @@ int main(int argc, char** argv) {
         cuda_alignment_batches = atoi(optarg);
         break;
 #endif
-      case 'f': gfa_path = optarg; break;
+      case 'F': gfa_path = optarg; break;
       case 'r': resume = true; break;
       case 'd': checkpoints = false; break;
       case 't': num_threads = atoi(optarg); break;
-      case 'v': std::cout << raven_version << std::endl; return 0;
+      case 'v': std::cout << VERSION << std::endl; return 0;
       case 'h': Help(); return 0;
       default: return 1;
     }
@@ -185,12 +189,7 @@ int main(int argc, char** argv) {
   }
 
   if (optind >= argc) {
-    std::cerr << "[raven::] error: missing input file!" << std::endl;
-    return 1;
-  }
-
-  auto sparser = CreateParser(argv[optind]);
-  if (sparser == nullptr) {
+    std::cerr << "[raven::] error: missing input file(s)!" << std::endl;
     return 1;
   }
 
@@ -217,11 +216,35 @@ int main(int argc, char** argv) {
 
   std::vector<std::unique_ptr<biosoup::NucleicAcid>> sequences;
   if (graph.stage() < -3 || num_polishing_rounds > std::max(0, graph.stage())) {
-    try {
-      sequences = sparser->Parse(-1);
-    } catch (const std::invalid_argument& exception) {
-      std::cerr << exception.what() << std::endl;
-      return 1;
+    for (int i = optind; i < argc; ++i) {
+      auto sparser = CreateParser(argv[i]);
+      if (sparser == nullptr) {
+        return 1;
+      }
+
+      std::vector<std::unique_ptr<biosoup::NucleicAcid>> chunk;
+      try {
+        chunk = sparser->Parse(-1);
+      } catch (const std::invalid_argument& exception) {
+        std::cerr << exception.what() << " (" << argv[i] << ")"
+                  << std::endl;
+        return 1;
+      }
+
+      if (chunk.empty()) {
+        std::cerr << "[raven::] warning: file " << argv[i] << " is empty"
+                  << std::endl;
+        continue;
+      }
+
+      if (sequences.empty()) {
+        sequences.swap(chunk);
+      } else {
+        sequences.insert(
+            sequences.end(),
+            std::make_move_iterator(chunk.begin()),
+            std::make_move_iterator(chunk.end()));
+      }
     }
 
     if (sequences.empty()) {
@@ -229,14 +252,14 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    std::cerr << "[raven::] loaded " << sequences.size() << " sequences "
+    std::cerr << "[raven::] loaded " << sequences.size() << " sequences "  // NOLINT
               << std::fixed << timer.Stop() << "s"
               << std::endl;
 
     timer.Start();
   }
 
-  graph.Construct(sequences);
+  graph.Construct(sequences, identity);
   graph.Assemble();
   graph.Polish(sequences, m, n, g, cuda_poa_batches, cuda_banded_alignment,
       cuda_alignment_batches, num_polishing_rounds);
