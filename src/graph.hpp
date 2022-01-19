@@ -231,6 +231,8 @@ class Graph {
 
     Edge(Node* tail, Node* head, std::uint32_t length);
 
+    Edge(Node* tail, Node* head, std::uint32_t length, std::uint32_t score);
+
     Edge(const Edge&) = delete;
     Edge& operator=(const Edge&) = delete;
 
@@ -253,6 +255,7 @@ class Graph {
 
     std::uint32_t id;
     std::uint32_t length;
+    std::uint32_t score;
     double weight;
     Node* tail;
     Node* head;

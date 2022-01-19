@@ -17,8 +17,6 @@
 #include "edlib.h"  // NOLINT
 #include "racon/polisher.hpp"
 
-#include "edlib.h"
-
 namespace raven {
 
 Graph::Node::Node(const biosoup::NucleicAcid& sequence)
@@ -69,6 +67,19 @@ Graph::Node::Node(Node* begin, Node* end)
 Graph::Edge::Edge(Node* tail, Node* head, std::uint32_t length)
     : id(num_objects++),
       length(length),
+      score(0),
+      weight(0),
+      tail(tail),
+      head(head),
+      pair() {
+  tail->outedges.emplace_back(this);
+  head->inedges.emplace_back(this);
+}
+
+Graph::Edge::Edge(Node* tail, Node* head, std::uint32_t length, std::uint32_t score)
+    : id(num_objects++),
+      length(length),
+      score(score),
       weight(0),
       tail(tail),
       head(head),
@@ -302,7 +313,7 @@ void Graph::Construct(
           sequences.begin() + j,
           sequences.begin() + i + 1,
           true);
-      minimizer_engine.Filter(0.001);  // LV: set filter from 0.001 to 0
+      minimizer_engine.Filter(0);  // LV: set filter from 0.001 to 0
 
       std::cerr << "[raven::Graph::Construct] minimized "
                 << j << " - " << i + 1 << " / " << sequences.size() << " "
@@ -354,9 +365,9 @@ void Graph::Construct(
 
                 num_overlaps[i] = std::min(
                     overlaps[i].size(),
-                    static_cast<std::size_t>(64));  // LV: 16 -> 32
+                    static_cast<std::size_t>(16));
 
-                if (overlaps[i].size() < 64) {  // LV: 16 -> 32
+                if (overlaps[i].size() < 16) {
                   return;
                 }
 
@@ -367,7 +378,7 @@ void Graph::Construct(
                     });
 
                 std::vector<biosoup::Overlap> tmp;
-                tmp.insert(tmp.end(), overlaps[i].begin(), overlaps[i].begin() + 64);  // NOLINT // LV: 16 -> 32
+                tmp.insert(tmp.end(), overlaps[i].begin(), overlaps[i].begin() + 16);  // NOLINT
                 tmp.swap(overlaps[i]);
               },
               it->id()));
@@ -515,8 +526,7 @@ void Graph::Construct(
             medians.begin(),
             medians.begin() + medians.size() / 2,
             medians.end());
-        // std::uint16_t median = medians[medians.size() / 2];  // LV: change to fixed 40 below
-        std::uint16_t median = 40;
+        std::uint16_t median = medians[medians.size() / 2];
 
         std::vector<std::future<void>> thread_futures;
         for (const auto& jt : it) {
@@ -627,7 +637,7 @@ void Graph::Construct(
       timer.Start();
 
       std::vector<std::future<std::vector<biosoup::Overlap>>> thread_futures;
-      minimizer_engine.Filter(0.001);  // LV: set filter to 0 from 0.001
+      minimizer_engine.Filter(0);  // LV: set filter to 0
       for (std::uint32_t k = 0; k < i + 1; ++k) {
         thread_futures.emplace_back(thread_pool_->Submit(
             [&] (std::uint32_t i) -> std::vector<biosoup::Overlap> {
@@ -772,7 +782,7 @@ void Graph::Construct(
         });
   }
 
-  if (stage_ == -4) {  // resolve repeat induced overlaps  // LV: added && false to not enter the if block
+  if (stage_ == -4 && false) {  // resolve repeat induced overlaps  // LV: added && false to not enter the if block
     timer.Start();
 
     while (true) {
@@ -871,6 +881,7 @@ void Graph::Construct(
     timer.Start();
 
     for (auto& it : overlaps.back()) {  // create edges
+      std::uint32_t score_save = it.score;
       if (!overlap_finalize(it)) {
         continue;
       }
@@ -889,7 +900,7 @@ void Graph::Construct(
         length_pair *= -1;
       }
 
-      auto edge = std::make_shared<Edge>(tail, head, length);
+      auto edge = std::make_shared<Edge>(tail, head, length, score_save);
       edges_.emplace_back(edge);
       edges_.emplace_back(std::make_shared<Edge>(head->pair, tail->pair, length_pair));  // NOLINT
       edge->pair = edges_.back().get();
@@ -924,17 +935,11 @@ void Graph::Assemble() {
 
   biosoup::Timer timer{};
 
-  PrintCsv("graph_1.csv");
-  PrintCsv("graph_before.csv");
-  PrintGfa("graph_before.gfa");
-
   if (stage_ == -3) {  // remove transitive edges
     timer.Start();
 
     PrintCsv("graph_1.csv");
     PrintGfa("graph_1.gfa");
-
-    // exit(1);
 
     RemoveTransitiveEdges();
 
@@ -943,15 +948,9 @@ void Graph::Assemble() {
               << std::endl;
   }
 
-<<<<<<< HEAD
-  PrintCsv("graph_2.csv");
-  // PrintCsv("graph_before.csv");
-  // PrintGfa("graph_before.gfa");
-=======
   // PrintCsv("graph_2.csv");
   // PrintGfa("graph_2.gfa");
   // exit(1);
->>>>>>> filter
 
   if (stage_ == -3) {  // checkpoint
     ++stage_;
@@ -980,12 +979,8 @@ void Graph::Assemble() {
               << std::endl;
   }
 
-<<<<<<< HEAD
-  PrintCsv("graph_3.csv");
-=======
   // PrintCsv("graph_3.csv");
   // PrintGfa("graph_3.gfa");
->>>>>>> filter
 
   if (stage_ == -2) {  // checkpoint
     ++stage_;
@@ -1006,15 +1001,6 @@ void Graph::Assemble() {
 
     CreateUnitigs(42);  // speed up force directed layout
 
-<<<<<<< HEAD
-    PrintCsv("graph_4.csv");
-    // PrintCsv("graph_before.csv");
-    // PrintGfa("graph_before.gfa");
-
-    RemoveLongEdges(16);
-
-    PrintCsv("graph_5.csv");
-=======
     // PrintCsv("graph_5.csv");
     // PrintGfa("graph_5.gfa");
 
@@ -1022,7 +1008,6 @@ void Graph::Assemble() {
 
     // PrintCsv("graph_6.csv");
     // PrintGfa("graph_6.gfa");
->>>>>>> filter
 
     std::cerr << "[raven::Graph::Assemble] removed long edges "
               << std::fixed << timer.Stop() << "s"
@@ -1045,8 +1030,6 @@ void Graph::Assemble() {
 
     timer.Stop();
   }
-
-  PrintCsv("graph_6.csv");
 
   if (stage_ == -1) {  // checkpoint
     ++stage_;
@@ -2164,22 +2147,31 @@ void Graph::PrintCsv(const std::string& path) const {
 	  << std::endl;
     }
   }
+  // char* query1 = "ACCTCTG";
+  // char* target1 = "ACTCTGAAA";
+  // EdlibAlignConfig config = edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, NULL, 0);
+  // EdlibAlignResult result1 = edlibAlign(query1, 7, target1, 9, config);
+  // if (result1.status == EDLIB_STATUS_OK) {
+  //   printf("%d %d", result1.editDistance, result1.alignmentLength);
+  // } else {
+  //   printf("ne\n");
+  // }
+  // std::string cigar(edlibAlignmentToCigar(result1.alignment, result1.alignmentLength, EDLIB_CIGAR_STANDARD));
+  // printf("%s ? \n", cigar.c_str());
+  // edlibFreeAlignResult(result1);
+  EdlibAlignConfig config = edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, NULL, 0);
   for (const auto& it : edges_) {
     if (it == nullptr) {
       continue;
     }
-<<<<<<< HEAD
-    std::string lhs{it->tail->sequence->InflateData(it->length)};
-    std::string rhs{it->head->sequence->InflateData(0, lhs.size())};
-=======
     std::string lhs{it->tail->sequence.InflateData(it->length)};
     std::string rhs{it->head->sequence.InflateData(0, lhs.size())};
->>>>>>> filter
     EdlibAlignResult result = edlibAlign(
         lhs.c_str(), lhs.size(),
 	rhs.c_str(), rhs.size(),
-	edlibDefaultAlignConfig());
+	config);
     double score = 1 - result.editDistance / static_cast<double>(lhs.size());
+    char* cigar = edlibAlignmentToCigar(result.alignment, result.alignmentLength, EDLIB_CIGAR_STANDARD);
 
     os << it->tail->id << " [" << it->tail->id / 2 << "]"
        << " LN:i:" << it->tail->sequence.inflated_len
@@ -2189,8 +2181,11 @@ void Graph::PrintCsv(const std::string& path) const {
        << " LN:i:" << it->head->sequence.inflated_len
        << " RC:i:" << it->head->count
        << ",1,"
-       << it->id << " " << it->length << " " << it->weight << " " << score
+       << it->id << " " << it->length << " " << it->weight << " " << score << " " << it->score << " " << cigar
        << std::endl;
+
+    free(cigar);
+    edlibFreeAlignResult(result);
   }
   for (const auto& it : nodes_) {  // circular edges TODO(rvaser): check
     if (it == nullptr || !it->is_circular) {
